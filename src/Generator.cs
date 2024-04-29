@@ -46,8 +46,9 @@ class Program
 
     string result_file = args[1];
     string api_version = args[2];
-    string[] extensions = args.Skip(3).ToArray();
-    string profile = "core"; //
+    string[] extensions = args.Skip(3).Where(e => !e.StartsWith("-")).ToArray();
+    bool wasmExport = args.Contains("--wasm");
+    string profile = "core";
 
     var target_feature = registry.Features.First(f => f.Name == api_version);
 
@@ -138,9 +139,10 @@ class Program
       stream.WriteLine("");
       stream.WriteLine("//");
       stream.WriteLine("// Generation parameters:");
-      stream.WriteLine("// API:        {0}", api_version);
-      stream.WriteLine("// Profile:    {0}", profile);
-      stream.WriteLine("// Extensions: {0}", string.Join(", ", extensions));
+      stream.WriteLine("// API:                     {0}", api_version);
+      stream.WriteLine("// Profile:                 {0}", profile);
+      stream.WriteLine("// Extensions:              {0}", string.Join(", ", extensions));
+      stream.WriteLine("// Exports WASM Functions?: {0}", wasmExport ? "Yes" : "No");
       stream.WriteLine("//");
       stream.WriteLine("");
       stream.WriteLine("//");
@@ -156,7 +158,7 @@ class Program
       stream.WriteLine();
       WriteConstants(stream, gl_set.enums);
       stream.WriteLine();
-      WriteCommands(stream, gl_set.commands);
+      WriteCommands(stream, gl_set.commands, wasmExport);
 
       stream.WriteLine("// Extensions:");
       stream.WriteLine();
@@ -166,42 +168,44 @@ class Program
 
         WriteConstants(stream, ext.Item2.enums);
         stream.WriteLine();
-        WriteCommands(stream, ext.Item2.commands);
-        stream.WriteLine();
-        WriteLoader(stream, ext.Item2.commands);
+        WriteCommands(stream, ext.Item2.commands, wasmExport);
+        if (!wasmExport) {
+          stream.WriteLine();
+          WriteLoader(stream, ext.Item2.commands);
+        }
 
         stream.WriteLine("};");
         stream.WriteLine();
       }
 
-      stream.WriteLine("// Loader API:");
-      WriteLoader(stream, gl_set.commands);
+      if (!wasmExport) {
+        stream.WriteLine("// Loader API:");
+        WriteLoader(stream, gl_set.commands);
+        stream.WriteLine();
 
-      stream.WriteLine();
+        stream.WriteLine("const function_signatures = struct {");
+        foreach (var cmd in all_commands)
+        {
+          stream.WriteLine("    const {0} = {1};", cmd.Prototype.Name, cmd.GetSignature(false, false));
+        }
+        stream.WriteLine("};");
 
-      stream.WriteLine("const function_signatures = struct {");
-      foreach (var cmd in all_commands)
-      {
-        stream.WriteLine("    const {0} = {1};", cmd.Prototype.Name, cmd.GetSignature(false));
+        stream.WriteLine();
+
+        stream.WriteLine("const function_pointers = struct {");
+        foreach (var cmd in all_commands)
+        {
+          stream.WriteLine("    var {0}: *const function_signatures.{0} = undefined;", cmd.Prototype.Name);
+        }
+        stream.WriteLine("};");
+        stream.WriteLine();
+        
+        stream.WriteLine("test {");
+        stream.WriteLine("    _ = load;");
+        stream.WriteLine("    @setEvalBranchQuota(100_000); // Yes, this is necessary. OpenGL gets quite large!");
+        stream.WriteLine("    std.testing.refAllDecls(@This());");
+        stream.WriteLine("}");
       }
-      stream.WriteLine("};");
-
-      stream.WriteLine();
-
-      stream.WriteLine("const function_pointers = struct {");
-      foreach (var cmd in all_commands)
-      {
-        stream.WriteLine("    var {0}: *const function_signatures.{0} = undefined;", cmd.Prototype.Name);
-      }
-      stream.WriteLine("};");
-
-      stream.WriteLine();
-
-      stream.WriteLine("test {");
-      stream.WriteLine("    _ = load;");
-      stream.WriteLine("    @setEvalBranchQuota(100_000); // Yes, this is necessary. OpenGL gets quite large!");
-      stream.WriteLine("    std.testing.refAllDecls(@This());");
-      stream.WriteLine("}");
     }
 
     return 0;
@@ -239,30 +243,34 @@ class Program
     }
   }
 
-  public static void WriteCommands(TextWriter stream, IEnumerable<Command> commands)
+  public static void WriteCommands(TextWriter stream, IEnumerable<Command> commands, bool wasmExport)
   {
     foreach (var cmd in commands)
     {
       stream.WriteLine();
       stream.Write("pub ");
-      stream.Write(cmd.GetSignature(true));
-      stream.WriteLine(" {");
+      stream.Write(cmd.GetSignature(true, wasmExport));
+      if (wasmExport) {
+        stream.WriteLine(";");
+      } else {
+        stream.WriteLine(" {");
 
-      stream.Write("    return @call(.always_tail, function_pointers.{0}, .{{", cmd.Prototype.Name);
-      if (cmd.Parameters != null)
-      {
-        int i = 0;
-        foreach (var param in cmd.Parameters)
+        stream.Write("    return @call(.always_tail, function_pointers.{0}, .{{", cmd.Prototype.Name);
+        if (cmd.Parameters != null)
         {
-          if (i > 0)
-            stream.Write(", ");
-          stream.Write("_{0}", param.Name);
-          i += 1;
+          int i = 0;
+          foreach (var param in cmd.Parameters)
+          {
+            if (i > 0)
+              stream.Write(", ");
+            stream.Write("_{0}", param.Name);
+            i += 1;
+          }
         }
-      }
-      stream.WriteLine("});");
+        stream.WriteLine("});");
 
-      stream.WriteLine("}");
+        stream.WriteLine("}");
+      }
     }
   }
 
@@ -522,7 +530,7 @@ public class Command
   [XmlElement("param")]
   public Parameter[] Parameters { get; set; }
 
-  public string GetSignature(bool includeName)
+  public string GetSignature(bool includeName, bool wasmExport)
   {
     var stream = new StringWriter();
 
@@ -534,6 +542,10 @@ public class Command
       {
         return_type = full_signature.Substring(0, index).Trim();
       }
+    }
+
+    if (wasmExport) {
+      stream.Write("extern ");
     }
 
     if (includeName)
@@ -556,7 +568,10 @@ public class Command
         count += 1;
       }
     }
-    stream.Write(") callconv(.C) ");
+    stream.Write(") ");
+    if (!wasmExport) {
+      stream.Write("callconv(.C) ");
+    }
 
     stream.Write(Program.TranslateC(return_type));
 
